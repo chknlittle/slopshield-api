@@ -32,6 +32,7 @@ async function routeRequest(request: Request, url: URL): Promise<Response> {
 const server = Bun.serve({
   hostname: config.host,
   port: config.port,
+  maxRequestBodySize: 10 * 1024 * 1024,
   async fetch(request) {
     const started = performance.now();
     const url = new URL(request.url);

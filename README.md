@@ -1,6 +1,6 @@
 # SlopShield API
 
-A small Bun/TypeScript API that puts a persistent read-through cache and queue in front of the SlopShield Engine v1. Requests never wait for uncached YouTube analyses: missing videos are queued in SQLite and processed in the background.
+A small Bun/TypeScript API that puts a persistent cache and queue in front of the SlopShield Engine v1. The browser extension supplies YouTube transcripts; requests return immediately while uncached analyses run in the background.
 
 ## Run
 
@@ -42,14 +42,19 @@ The cache key is `(video_id, engine_version)`. Changing the configured engine ve
 ```bash
 curl -sS http://localhost:3000/v1/analyses \
   -H 'content-type: application/json' \
-  -d '{"urls":[
-    "https://youtube.com/watch?v=_xnni6MrTHM",
-    "https://youtu.be/_xnni6MrTHM?t=10",
-    "not-a-video"
+  -d '{"videos":[
+    {
+      "url":"https://youtube.com/watch?v=_xnni6MrTHM",
+      "transcript":"[0.00 -> 3.20] Browser-fetched caption text"
+    }
   ]}' | jq
 ```
 
-`POST /v1/analyses` accepts 1–100 strings and returns HTTP 202 immediately. It preserves input order and emits one response entry per input. Alternate URLs for the same video share one database row and one unit of work. Repeat the same request to observe `queued` → `running` → `completed` (or `failed`). Invalid entries fail individually with `invalid_youtube_url`.
+`POST /v1/analyses` accepts 1–100 `{url, transcript?}` objects and returns HTTP 202 immediately. It preserves input order and emits one response entry per input. Alternate URLs for the same video share one database row and one unit of work.
+
+For an uncached video, `transcript` is required and must contain the timestamped caption text fetched by the browser. Poll an existing submission by sending the same `url` without a transcript. A cache miss without a stored transcript returns `status: "missing"` and `needs_transcript: true` without enqueueing work. If a transcript is already stored for the video, the API queues the active engine version itself.
+
+Transcripts are persisted once per video in `video_transcripts`, independently of engine-version results. Later public submissions do not overwrite the stored transcript. This allows a new engine version to re-score stored videos without asking the browser to fetch their captions again.
 
 A completed entry resembles:
 
@@ -94,4 +99,4 @@ Health includes API status, configured engine URL/version and current reachabili
 
 ## Queue behavior
 
-SQLite's `analysis_results` table is both cache and persistent queue. Workers atomically claim rows. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.
+SQLite's `analysis_results` table is both result cache and persistent queue. `video_transcripts` stores reusable browser-supplied transcripts separately. Workers atomically claim analysis rows and join them to the corresponding transcript. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.

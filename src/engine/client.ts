@@ -48,17 +48,20 @@ async function readAnalysisResponse(response: Response, videoId: string): Promis
 export class EngineClient {
   constructor(private readonly config: Config) {}
 
-  async analyze(videoId: string, shutdownSignal: AbortSignal): Promise<EngineAnalysis> {
-    const response = await this.requestAnalysis(videoId, shutdownSignal);
+  async analyze(videoId: string, transcript: string, shutdownSignal: AbortSignal): Promise<EngineAnalysis> {
+    const response = await this.requestAnalysis(videoId, transcript, shutdownSignal);
     return readAnalysisResponse(response, videoId);
   }
 
-  private async requestAnalysis(videoId: string, shutdownSignal: AbortSignal): Promise<Response> {
+  private async requestAnalysis(videoId: string, transcript: string, shutdownSignal: AbortSignal): Promise<Response> {
     try {
       return await fetch(`${this.config.engineUrl}/analyze`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url: `https://www.youtube.com/watch?v=${videoId}` }),
+        body: JSON.stringify({
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          transcript,
+        }),
         signal: AbortSignal.any([shutdownSignal, AbortSignal.timeout(this.config.engineTimeoutMs)]),
       });
     } catch (error) {

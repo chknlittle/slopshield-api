@@ -105,7 +105,10 @@ export class AnalysisWorker {
     log("info", "analysis.started", { analysis_id: row.id, video_id: row.video_id, attempt: row.attempt_count });
 
     try {
-      const result = await this.engine.analyze(row.video_id, signal);
+      if (row.transcript_text === null) {
+        throw new EngineError("engine_rejected_request", "Queued analysis has no transcript.", false);
+      }
+      const result = await this.engine.analyze(row.video_id, row.transcript_text, signal);
       this.analyses.complete(row.id, result.verdict === "ai_suspect", JSON.stringify(result));
       log("info", "analysis.completed", { analysis_id: row.id, video_id: row.video_id, verdict: result.verdict });
     } catch (error) {
