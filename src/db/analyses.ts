@@ -48,7 +48,7 @@ export class AnalysisRepository {
     videoId: string,
     canonicalUrl: string,
     transcript: string | null,
-  ): { row: AnalysisRow; queued: boolean } | null {
+  ): { queued: boolean } | null {
     const now = new Date().toISOString();
     if (transcript !== null) {
       this.db.query(`
@@ -79,9 +79,7 @@ export class AnalysisRepository {
       queued = update.changes === 1;
     }
 
-    const row = this.find(videoId);
-    if (row === null) throw new Error("Failed to read analysis row after submission");
-    return { row, queued };
+    return { queued };
   }
 
   recoverRunning(): number {
