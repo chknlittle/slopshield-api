@@ -58,7 +58,7 @@ For an uncached video without channel metadata—or for the selected evidence vi
 
 Transcripts are persisted once per video in `video_transcripts`, independently of engine-version results. Later public submissions do not overwrite the stored transcript. This allows a new engine version to re-score stored videos without asking the browser to fetch their captions again.
 
-When channel IDs are supplied, the first `evidence_candidate: true` video encountered for a channel becomes its evidence video for the active engine version. The extension marks only viewport videos as candidates, preventing an offscreen card from blocking a visible sibling. Only that video may request and submit a transcript. Other videos from the channel wait for the evidence analysis and then inherit its verdict. Inferred results are never inserted as direct evidence, so inference cannot recursively create new evidence.
+When channel IDs are supplied, the first `evidence_candidate: true` video encountered becomes the channel's primary evidence for the active engine version. A benign primary result verifies the channel immediately. An AI-positive primary result remains a direct video verdict until a different candidate video is independently analyzed: two positive results classify the channel as AI, while a benign confirmation classifies it as benign. The extension marks only viewport videos as candidates. Inferred results are never stored as direct evidence.
 
 A completed entry resembles:
 
@@ -86,7 +86,7 @@ A completed entry resembles:
 }
 ```
 
-`is_ai` is `true` only for engine verdict `ai_suspect`, `false` only for `most likely not AI`, and `null` for queued/running/failed work. Engine and transcript failures are never interpreted as not-AI. `classification_source` is `video` for direct evidence and `channel` for an inherited verdict; `evidence_video_id` identifies the sole directly analyzed video. `cached` indicates whether the relevant result existed before that POST.
+`is_ai` is `true` only for engine verdict `ai_suspect`, `false` only for `most likely not AI`, and `null` for queued/running/failed work. Engine and transcript failures are never interpreted as not-AI. `classification_source` is `video` for direct evidence and `channel` for an inherited verdict; `evidence_video_id` identifies the direct result returned for that entry. `cached` indicates whether the relevant result existed before that POST.
 
 ### Read one cached analysis
 
@@ -106,4 +106,4 @@ Health includes API status, configured engine URL/version and current reachabili
 
 ## Queue behavior
 
-SQLite's `analysis_results` table is both direct-result cache and persistent queue. `video_transcripts` stores reusable browser-supplied transcripts separately. `video_channels` records immutable video/channel associations, while `channel_claims` selects one evidence video per `(channel_id, engine_version)`. Workers atomically claim analysis rows and join them to the corresponding transcript. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.
+SQLite's `analysis_results` table is both direct-result cache and persistent queue. `video_transcripts` stores reusable browser-supplied transcripts separately. `video_channels` records immutable video/channel associations, while `channel_claims` tracks primary and optional confirmation evidence per `(channel_id, engine_version)`. Workers atomically claim analysis rows and join them to the corresponding transcript. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.

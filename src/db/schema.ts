@@ -36,13 +36,20 @@ export function migrate(db: Database): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+  `);
+
+  const version = (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
+  if (version < 4) db.exec("DROP TABLE IF EXISTS channel_claims");
+  db.exec(`
     CREATE TABLE IF NOT EXISTS channel_claims (
       channel_id TEXT NOT NULL,
       engine_version TEXT NOT NULL,
-      evidence_video_id TEXT NOT NULL,
+      primary_video_id TEXT NOT NULL,
+      confirmation_video_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
-      PRIMARY KEY(channel_id, engine_version)
+      PRIMARY KEY(channel_id, engine_version),
+      CHECK (confirmation_video_id IS NULL OR confirmation_video_id <> primary_video_id)
     );
   `);
 
@@ -59,5 +66,5 @@ export function migrate(db: Database): void {
         WHERE video_transcripts.video_id = analysis_results.video_id
       );
   `);
-  db.exec("PRAGMA user_version = 3");
+  db.exec("PRAGMA user_version = 4");
 }

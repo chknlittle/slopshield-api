@@ -22,8 +22,9 @@ export interface AnalysisRow {
   completed_at: string | null;
 }
 
-interface ChannelClaimRow {
-  evidence_video_id: string;
+export interface ChannelClaimRow {
+  primary_video_id: string;
+  confirmation_video_id: string | null;
 }
 
 export interface QueueCounts {
@@ -67,7 +68,10 @@ export class AnalysisRepository {
       SELECT 1
       FROM channel_claims
       INNER JOIN analysis_results
-        ON analysis_results.video_id = channel_claims.evidence_video_id
+        ON analysis_results.video_id IN (
+          channel_claims.primary_video_id,
+          channel_claims.confirmation_video_id
+        )
        AND analysis_results.engine_version = channel_claims.engine_version
       WHERE channel_claims.channel_id = ? AND channel_claims.engine_version = ?
         AND analysis_results.status = 'completed'
@@ -76,14 +80,18 @@ export class AnalysisRepository {
 
     this.db.query(`
       DELETE FROM channel_claims
-      WHERE channel_id = ? AND engine_version = ? AND evidence_video_id = ?
+      WHERE channel_id = ? AND engine_version = ?
+        AND (primary_video_id = ? OR confirmation_video_id = ?)
         AND NOT EXISTS (
           SELECT 1 FROM analysis_results
-          WHERE analysis_results.video_id = channel_claims.evidence_video_id
+          WHERE analysis_results.video_id IN (
+              channel_claims.primary_video_id,
+              channel_claims.confirmation_video_id
+            )
             AND analysis_results.engine_version = channel_claims.engine_version
             AND analysis_results.status = 'completed'
         )
-    `).run(row.channel_id, this.engineVersion, videoId);
+    `).run(row.channel_id, this.engineVersion, videoId, videoId);
     this.db.query(`
       UPDATE video_channels SET channel_id = ?, updated_at = ? WHERE video_id = ?
     `).run(channelId, now, videoId);
@@ -92,47 +100,87 @@ export class AnalysisRepository {
 
   findChannelClaim(channelId: string): ChannelClaimRow | null {
     return this.db.query(`
-      SELECT evidence_video_id FROM channel_claims
+      SELECT primary_video_id, confirmation_video_id FROM channel_claims
       WHERE channel_id = ? AND engine_version = ?
     `).get(channelId, this.engineVersion) as ChannelClaimRow | null;
   }
 
-  claimChannel(channelId: string, evidenceVideoId: string): ChannelClaimRow {
+  findCompletedChannelEvidence(channelId: string, excludedVideoId: string | null): string | null {
+    const row = this.db.query(`
+      SELECT analysis_results.video_id
+      FROM video_channels
+      INNER JOIN analysis_results USING (video_id)
+      WHERE video_channels.channel_id = ?
+        AND analysis_results.engine_version = ?
+        AND analysis_results.status = 'completed'
+        AND (? IS NULL OR analysis_results.video_id <> ?)
+      ORDER BY analysis_results.is_ai, analysis_results.completed_at, analysis_results.id
+      LIMIT 1
+    `).get(channelId, this.engineVersion, excludedVideoId, excludedVideoId) as { video_id: string } | null;
+    return row?.video_id ?? null;
+  }
+
+  claimChannel(channelId: string, primaryVideoId: string): ChannelClaimRow {
     const now = new Date().toISOString();
     this.db.query(`
       INSERT INTO channel_claims
-        (channel_id, engine_version, evidence_video_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?)
+        (channel_id, engine_version, primary_video_id, confirmation_video_id, created_at, updated_at)
+      VALUES (?, ?, ?, NULL, ?, ?)
       ON CONFLICT(channel_id, engine_version) DO NOTHING
-    `).run(channelId, this.engineVersion, evidenceVideoId, now, now);
+    `).run(channelId, this.engineVersion, primaryVideoId, now, now);
 
     const claim = this.findChannelClaim(channelId);
     if (claim === null) throw new Error("Channel claim disappeared after insertion");
     return claim;
   }
 
-  reclaimStaleChannel(channelId: string, evidenceVideoId: string, staleBefore: string): boolean {
+  reclaimPrimary(channelId: string, videoId: string, staleBefore: string): boolean {
     const now = new Date().toISOString();
     return this.db.query(`
       UPDATE channel_claims
-      SET evidence_video_id = ?, updated_at = ?
-      WHERE channel_id = ? AND engine_version = ?
+      SET primary_video_id = ?, confirmation_video_id = NULL, updated_at = ?
+      WHERE channel_id = ? AND engine_version = ? AND primary_video_id <> ?
         AND (
           EXISTS (
             SELECT 1 FROM analysis_results
-            WHERE analysis_results.video_id = channel_claims.evidence_video_id
+            WHERE analysis_results.video_id = channel_claims.primary_video_id
               AND analysis_results.engine_version = channel_claims.engine_version
               AND analysis_results.status = 'failed'
           )
           OR (
             updated_at <= ? AND NOT EXISTS (
               SELECT 1 FROM analysis_results
-              WHERE analysis_results.video_id = channel_claims.evidence_video_id
+              WHERE analysis_results.video_id = channel_claims.primary_video_id
                 AND analysis_results.engine_version = channel_claims.engine_version
             )
           )
         )
-    `).run(evidenceVideoId, now, channelId, this.engineVersion, staleBefore).changes === 1;
+    `).run(videoId, now, channelId, this.engineVersion, videoId, staleBefore).changes === 1;
+  }
+
+  claimConfirmation(channelId: string, videoId: string, staleBefore: string): boolean {
+    const now = new Date().toISOString();
+    return this.db.query(`
+      UPDATE channel_claims
+      SET confirmation_video_id = ?, updated_at = ?
+      WHERE channel_id = ? AND engine_version = ? AND primary_video_id <> ?
+        AND (
+          confirmation_video_id IS NULL
+          OR EXISTS (
+            SELECT 1 FROM analysis_results
+            WHERE analysis_results.video_id = channel_claims.confirmation_video_id
+              AND analysis_results.engine_version = channel_claims.engine_version
+              AND analysis_results.status = 'failed'
+          )
+          OR (
+            updated_at <= ? AND NOT EXISTS (
+              SELECT 1 FROM analysis_results
+              WHERE analysis_results.video_id = channel_claims.confirmation_video_id
+                AND analysis_results.engine_version = channel_claims.engine_version
+            )
+          )
+        )
+    `).run(videoId, now, channelId, this.engineVersion, videoId, staleBefore).changes === 1;
   }
 
   submit(

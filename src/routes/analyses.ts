@@ -301,27 +301,38 @@ export class AnalysisRoutes {
     }
 
     for (const [channelId, group] of byChannel) {
-      const completed = group.find((input) => {
-        if (input.videoId === null) return false;
-        return this.analyses.find(input.videoId)?.status === "completed";
-      });
-      const claim = this.analyses.findChannelClaim(channelId);
-      const claimedRow = claim === null ? null : this.analyses.find(claim.evidence_video_id);
-      const candidate = claimedRow?.status === "failed"
-        ? (completed?.videoId !== claim?.evidence_video_id ? completed : undefined) ??
-          group.find((input) => input.evidenceCandidate && input.videoId !== claim?.evidence_video_id)
-        : completed ?? group.find((input) => input.evidenceCandidate);
+      const candidateExcluding = (excluded: string | null) =>
+        this.analyses.findCompletedChannelEvidence(channelId, excluded) ??
+        group.find((input) => input.videoId !== excluded && input.evidenceCandidate)?.videoId ??
+        null;
 
+      const claim = this.analyses.findChannelClaim(channelId);
       if (claim === null) {
-        if (candidate?.videoId !== null && candidate?.videoId !== undefined) {
-          this.analyses.claimChannel(channelId, candidate.videoId);
+        const candidate = candidateExcluding(null);
+        if (candidate) this.analyses.claimChannel(channelId, candidate);
+        continue;
+      }
+
+      const staleBefore = new Date(Date.now() - CHANNEL_CLAIM_LEASE_MS).toISOString();
+      const primary = this.analyses.find(claim.primary_video_id);
+      if (primary?.status === "failed" || primary === null) {
+        const candidate = candidateExcluding(claim.primary_video_id);
+        if (candidate) {
+          this.analyses.reclaimPrimary(channelId, candidate, staleBefore);
         }
         continue;
       }
 
-      if (candidate?.videoId && candidate.videoId !== claim.evidence_video_id) {
-        const staleBefore = new Date(Date.now() - CHANNEL_CLAIM_LEASE_MS).toISOString();
-        this.analyses.reclaimStaleChannel(channelId, candidate.videoId, staleBefore);
+      if (primary.status === "completed" && primary.is_ai === 1) {
+        const confirmation = claim.confirmation_video_id === null
+          ? null
+          : this.analyses.find(claim.confirmation_video_id);
+        if (claim.confirmation_video_id === null || confirmation?.status === "failed" || confirmation === null) {
+          const candidate = candidateExcluding(claim.primary_video_id);
+          if (candidate) {
+            this.analyses.claimConfirmation(channelId, candidate, staleBefore);
+          }
+        }
       }
     }
   }
@@ -337,15 +348,19 @@ export class AnalysisRoutes {
         wasCached.set(input.videoId, existing !== null);
 
         const claim = input.channelId === null ? null : this.analyses.findChannelClaim(input.channelId);
-        const maySubmit = input.channelId === null || claim?.evidence_video_id === input.videoId;
+        const maySubmit = input.channelId === null ||
+          claim?.primary_video_id === input.videoId ||
+          claim?.confirmation_video_id === input.videoId;
         if (maySubmit && (existing === null || input.transcript !== null)) {
           submissions.set(input.videoId, input.transcript);
         }
       } else if (input.transcript !== null) {
         const claim = input.channelId === null ? null : this.analyses.findChannelClaim(input.channelId);
-        if (input.channelId === null || claim?.evidence_video_id === input.videoId) {
-          submissions.set(input.videoId, input.transcript);
-        }
+        if (
+          input.channelId === null ||
+          claim?.primary_video_id === input.videoId ||
+          claim?.confirmation_video_id === input.videoId
+        ) submissions.set(input.videoId, input.transcript);
       }
     }
 
@@ -365,25 +380,40 @@ export class AnalysisRoutes {
       if (videoId === null) throw new Error("Normalized input has neither video ID nor error");
 
       const claim = channelId === null ? null : this.analyses.findChannelClaim(channelId);
-      if (claim !== null && claim.evidence_video_id !== videoId) {
-        const evidence = this.analyses.find(claim.evidence_video_id);
-        if (evidence === null) {
-          return waitingOnChannelEntry(
-            input,
-            videoId,
-            channelId!,
-            this.config.engineVersion,
-            claim.evidence_video_id,
+      const isEvidence = claim !== null && (
+        claim.primary_video_id === videoId || claim.confirmation_video_id === videoId
+      );
+      if (claim !== null && !isEvidence) {
+        const primary = this.analyses.find(claim.primary_video_id);
+        if (primary?.status === "completed" && primary.is_ai === 0) {
+          return entryFromRow(
+            input, videoId, channelId, primary, true, "channel", claim.primary_video_id,
           );
         }
-        return entryFromRow(
+        if (primary?.status === "completed" && primary.is_ai === 1 && claim.confirmation_video_id !== null) {
+          const confirmation = this.analyses.find(claim.confirmation_video_id);
+          if (confirmation?.status === "completed") {
+            return entryFromRow(
+              input, videoId, channelId, confirmation, true, "channel", claim.confirmation_video_id,
+            );
+          }
+          if (confirmation?.status === "failed") {
+            return entryFromRow(
+              input, videoId, channelId, confirmation, true, "channel", claim.confirmation_video_id,
+            );
+          }
+        }
+        if (primary?.status === "failed") {
+          return entryFromRow(
+            input, videoId, channelId, primary, true, "channel", claim.primary_video_id,
+          );
+        }
+        return waitingOnChannelEntry(
           input,
           videoId,
-          channelId,
-          evidence,
-          true,
-          "channel",
-          claim.evidence_video_id,
+          channelId!,
+          this.config.engineVersion,
+          claim.confirmation_video_id ?? claim.primary_video_id,
         );
       }
 
