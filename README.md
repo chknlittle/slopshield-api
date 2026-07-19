@@ -33,7 +33,7 @@ The default API address is `http://localhost:3000`. Runtime state is stored in `
 | `SLOPSHIELD_WORKER_CONCURRENCY` | `2` |
 | `SLOPSHIELD_ENGINE_TIMEOUT_MS` | `300000` |
 
-The cache key is `(video_id, engine_version)`. Changing the configured engine version creates a fresh cache namespace without deleting old results.
+Direct engine results remain keyed by `(video_id, engine_version)`. Channel evidence claims are keyed by `(channel_id, engine_version)`, so changing the configured engine version creates a fresh video and channel cache namespace without deleting old results.
 
 ## API
 
@@ -45,16 +45,20 @@ curl -sS http://localhost:3000/v1/analyses \
   -d '{"videos":[
     {
       "url":"https://youtube.com/watch?v=_xnni6MrTHM",
+      "channel_id":"UCxxxxxxxxxxxxxxxxxxxxxx",
+      "evidence_candidate":true,
       "transcript":"[0.00 -> 3.20] Browser-fetched caption text"
     }
   ]}' | jq
 ```
 
-`POST /v1/analyses` accepts 1–100 `{url, transcript?}` objects and returns HTTP 202 immediately. It preserves input order and emits one response entry per input. Alternate URLs for the same video share one database row and one unit of work.
+`POST /v1/analyses` accepts 1–100 `{url, channel_id?, evidence_candidate?, transcript?}` objects and returns HTTP 202 immediately. It preserves input order and emits one response entry per input. `channel_id`, when supplied, must be YouTube's immutable 24-character `UC…` ID. Alternate URLs for the same video share one database row and one unit of work.
 
-For an uncached video, `transcript` is required and must contain the timestamped caption text fetched by the browser. Poll an existing submission by sending the same `url` without a transcript. A cache miss without a stored transcript returns `status: "missing"` and `needs_transcript: true` without enqueueing work. If a transcript is already stored for the video, the API queues the active engine version itself.
+For an uncached video without channel metadata—or for the selected evidence video of a new channel—`transcript` is required and must contain the timestamped caption text fetched by the browser. Poll an existing submission by sending the same `url` without a transcript. An evidence cache miss without a stored transcript returns `status: "missing"` and `needs_transcript: true` without enqueueing work; channel siblings wait without requesting transcripts. If a transcript is already stored for the evidence video, the API queues the active engine version itself.
 
 Transcripts are persisted once per video in `video_transcripts`, independently of engine-version results. Later public submissions do not overwrite the stored transcript. This allows a new engine version to re-score stored videos without asking the browser to fetch their captions again.
+
+When channel IDs are supplied, the first `evidence_candidate: true` video encountered for a channel becomes its evidence video for the active engine version. The extension marks only viewport videos as candidates, preventing an offscreen card from blocking a visible sibling. Only that video may request and submit a transcript. Other videos from the channel wait for the evidence analysis and then inherit its verdict. Inferred results are never inserted as direct evidence, so inference cannot recursively create new evidence.
 
 A completed entry resembles:
 
@@ -62,10 +66,13 @@ A completed entry resembles:
 {
   "input_url": "https://youtube.com/watch?v=_xnni6MrTHM",
   "video_id": "_xnni6MrTHM",
+  "channel_id": "UCxxxxxxxxxxxxxxxxxxxxxx",
   "engine_version": "v1",
   "status": "completed",
   "cached": true,
   "is_ai": true,
+  "classification_source": "video",
+  "evidence_video_id": "_xnni6MrTHM",
   "result": {
     "video_id": "_xnni6MrTHM",
     "verdict": "ai_suspect",
@@ -79,7 +86,7 @@ A completed entry resembles:
 }
 ```
 
-`is_ai` is `true` only for engine verdict `ai_suspect`, `false` only for `most likely not AI`, and `null` for queued/running/failed work. Engine and transcript failures are never interpreted as not-AI. `cached` indicates whether the cache row existed before that POST.
+`is_ai` is `true` only for engine verdict `ai_suspect`, `false` only for `most likely not AI`, and `null` for queued/running/failed work. Engine and transcript failures are never interpreted as not-AI. `classification_source` is `video` for direct evidence and `channel` for an inherited verdict; `evidence_video_id` identifies the sole directly analyzed video. `cached` indicates whether the relevant result existed before that POST.
 
 ### Read one cached analysis
 
@@ -99,4 +106,4 @@ Health includes API status, configured engine URL/version and current reachabili
 
 ## Queue behavior
 
-SQLite's `analysis_results` table is both result cache and persistent queue. `video_transcripts` stores reusable browser-supplied transcripts separately. Workers atomically claim analysis rows and join them to the corresponding transcript. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.
+SQLite's `analysis_results` table is both direct-result cache and persistent queue. `video_transcripts` stores reusable browser-supplied transcripts separately. `video_channels` records immutable video/channel associations, while `channel_claims` selects one evidence video per `(channel_id, engine_version)`. Workers atomically claim analysis rows and join them to the corresponding transcript. New inserts wake the in-process workers immediately; idle workers block without polling SQLite, and scheduled retries use a timer for their exact `next_retry_at` deadline. Interrupted `running` rows return to `queued` on startup. Transient failures receive up to three total attempts with exponential backoff; terminal failures preserve a stable error code and always have `is_ai: null`. SIGINT/SIGTERM stops HTTP intake, aborts/awaits workers, and closes SQLite.

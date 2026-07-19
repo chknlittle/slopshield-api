@@ -3,6 +3,10 @@ import { AnalysisRepository, type AnalysisRow, type AnalysisStatus } from "../db
 import { canonicalYouTubeUrl, parseVideoId } from "../youtube/urls";
 
 const MAX_TRANSCRIPT_CHARACTERS = 2_000_000;
+const CHANNEL_CLAIM_LEASE_MS = 10 * 60_000;
+const CHANNEL_ID = /^UC[A-Za-z0-9_-]{22}$/;
+
+type ClassificationSource = "video" | "channel";
 
 interface ApiError {
   code: string;
@@ -12,11 +16,14 @@ interface ApiError {
 interface AnalysisEntry {
   input_url: unknown;
   video_id: string | null;
+  channel_id: string | null;
   engine_version: string;
   status: AnalysisStatus;
   cached: boolean;
   needs_transcript: boolean;
   is_ai: boolean | null;
+  classification_source: ClassificationSource | null;
+  evidence_video_id: string | null;
   result: unknown | null;
   error: ApiError | null;
 }
@@ -24,6 +31,8 @@ interface AnalysisEntry {
 interface NormalizedInput {
   input: unknown;
   videoId: string | null;
+  channelId: string | null;
+  evidenceCandidate: boolean;
   transcript: string | null;
   error: ApiError | null;
 }
@@ -36,15 +45,26 @@ function json(value: unknown, status = 200): Response {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
 
-function entryFromRow(input: unknown, row: AnalysisRow, cached: boolean): AnalysisEntry {
+function entryFromRow(
+  input: unknown,
+  requestedVideoId: string,
+  channelId: string | null,
+  row: AnalysisRow,
+  cached: boolean,
+  source: ClassificationSource,
+  evidenceVideoId: string,
+): AnalysisEntry {
   return {
     input_url: input,
-    video_id: row.video_id,
+    video_id: requestedVideoId,
+    channel_id: channelId,
     engine_version: row.engine_version,
     status: row.status,
     cached,
     needs_transcript: false,
     is_ai: row.status === "completed" ? row.is_ai === 1 : null,
+    classification_source: source,
+    evidence_video_id: evidenceVideoId,
     result: row.result_json === null ? null : JSON.parse(row.result_json),
     error: row.error_code === null ? null : {
       code: row.error_code,
@@ -56,19 +76,90 @@ function entryFromRow(input: unknown, row: AnalysisRow, cached: boolean): Analys
 function failedEntry(
   input: unknown,
   videoId: string | null,
+  channelId: string | null,
   engineVersion: string,
   error: ApiError,
 ): AnalysisEntry {
   return {
     input_url: input,
     video_id: videoId,
+    channel_id: channelId,
     engine_version: engineVersion,
     status: "failed",
     cached: false,
     needs_transcript: false,
     is_ai: null,
+    classification_source: null,
+    evidence_video_id: null,
     result: null,
     error,
+  };
+}
+
+function missingEntry(
+  input: unknown,
+  videoId: string,
+  channelId: string | null,
+  engineVersion: string,
+): AnalysisEntry {
+  return {
+    input_url: input,
+    video_id: videoId,
+    channel_id: channelId,
+    engine_version: engineVersion,
+    status: "missing",
+    cached: false,
+    needs_transcript: true,
+    is_ai: null,
+    classification_source: "video",
+    evidence_video_id: videoId,
+    result: null,
+    error: null,
+  };
+}
+
+function unclaimedChannelEntry(
+  input: unknown,
+  videoId: string,
+  channelId: string,
+  engineVersion: string,
+): AnalysisEntry {
+  return {
+    input_url: input,
+    video_id: videoId,
+    channel_id: channelId,
+    engine_version: engineVersion,
+    status: "queued",
+    cached: false,
+    needs_transcript: false,
+    is_ai: null,
+    classification_source: null,
+    evidence_video_id: null,
+    result: null,
+    error: null,
+  };
+}
+
+function waitingOnChannelEntry(
+  input: unknown,
+  videoId: string,
+  channelId: string,
+  engineVersion: string,
+  evidenceVideoId: string,
+): AnalysisEntry {
+  return {
+    input_url: input,
+    video_id: videoId,
+    channel_id: channelId,
+    engine_version: engineVersion,
+    status: "queued",
+    cached: false,
+    needs_transcript: false,
+    is_ai: null,
+    classification_source: "channel",
+    evidence_video_id: evidenceVideoId,
+    result: null,
+    error: null,
   };
 }
 
@@ -96,6 +187,8 @@ function normalizeInputs(inputs: unknown[]): NormalizedInput[] {
       return {
         input: item,
         videoId: null,
+        channelId: null,
+        evidenceCandidate: false,
         transcript: null,
         error: { code: "invalid_video", message: "Each videos entry must be an object containing url." },
       };
@@ -107,16 +200,37 @@ function normalizeInputs(inputs: unknown[]): NormalizedInput[] {
       return {
         input,
         videoId: null,
+        channelId: null,
+        evidenceCandidate: false,
         transcript: null,
         error: { code: "invalid_youtube_url", message: "url must be a supported YouTube URL or 11-character video ID." },
       };
     }
 
-    if (!("transcript" in item)) return { input, videoId, transcript: null, error: null };
+    let channelId: string | null = null;
+    if ("channel_id" in item) {
+      if (typeof item.channel_id !== "string" || !CHANNEL_ID.test(item.channel_id)) {
+        return {
+          input,
+          videoId,
+          channelId: null,
+          evidenceCandidate: false,
+          transcript: null,
+          error: { code: "invalid_channel_id", message: "channel_id must be an immutable 24-character YouTube UC channel ID." },
+        };
+      }
+      channelId = item.channel_id;
+    }
+
+    const evidenceCandidate = !("evidence_candidate" in item) || item.evidence_candidate === true;
+
+    if (!("transcript" in item)) return { input, videoId, channelId, evidenceCandidate, transcript: null, error: null };
     if (typeof item.transcript !== "string" || item.transcript.trim().length === 0) {
       return {
         input,
         videoId,
+        channelId,
+        evidenceCandidate,
         transcript: null,
         error: { code: "invalid_transcript", message: "transcript must be a non-empty string when provided." },
       };
@@ -125,6 +239,8 @@ function normalizeInputs(inputs: unknown[]): NormalizedInput[] {
       return {
         input,
         videoId,
+        channelId,
+        evidenceCandidate,
         transcript: null,
         error: {
           code: "transcript_too_large",
@@ -133,22 +249,8 @@ function normalizeInputs(inputs: unknown[]): NormalizedInput[] {
       };
     }
 
-    return { input, videoId, transcript: item.transcript, error: null };
+    return { input, videoId, channelId, evidenceCandidate, transcript: item.transcript, error: null };
   });
-}
-
-function missingEntry(input: unknown, videoId: string, engineVersion: string): AnalysisEntry {
-  return {
-    input_url: input,
-    video_id: videoId,
-    engine_version: engineVersion,
-    status: "missing",
-    cached: false,
-    needs_transcript: true,
-    is_ai: null,
-    result: null,
-    error: null,
-  };
 }
 
 function batchResponse(engineVersion: string, entries: AnalysisEntry[]): Response {
@@ -175,9 +277,53 @@ export class AnalysisRoutes {
     if (!batch.ok) return batch.response;
 
     const inputs = normalizeInputs(batch.inputs);
+    this.registerChannelsAndClaims(inputs);
     const wasCached = this.submitAvailableAnalyses(inputs);
     const entries = this.loadEntries(inputs, wasCached);
     return batchResponse(this.config.engineVersion, entries);
+  }
+
+  private registerChannelsAndClaims(inputs: NormalizedInput[]): void {
+    const byChannel = new Map<string, NormalizedInput[]>();
+
+    for (const input of inputs) {
+      if (input.videoId === null || input.channelId === null || input.error !== null) continue;
+      if (!this.analyses.associateChannel(input.videoId, input.channelId)) {
+        input.error = {
+          code: "channel_mismatch",
+          message: "This video is already associated with a different immutable channel ID.",
+        };
+        continue;
+      }
+      const group = byChannel.get(input.channelId) ?? [];
+      group.push(input);
+      byChannel.set(input.channelId, group);
+    }
+
+    for (const [channelId, group] of byChannel) {
+      const completed = group.find((input) => {
+        if (input.videoId === null) return false;
+        return this.analyses.find(input.videoId)?.status === "completed";
+      });
+      const claim = this.analyses.findChannelClaim(channelId);
+      const claimedRow = claim === null ? null : this.analyses.find(claim.evidence_video_id);
+      const candidate = claimedRow?.status === "failed"
+        ? (completed?.videoId !== claim?.evidence_video_id ? completed : undefined) ??
+          group.find((input) => input.evidenceCandidate && input.videoId !== claim?.evidence_video_id)
+        : completed ?? group.find((input) => input.evidenceCandidate);
+
+      if (claim === null) {
+        if (candidate?.videoId !== null && candidate?.videoId !== undefined) {
+          this.analyses.claimChannel(channelId, candidate.videoId);
+        }
+        continue;
+      }
+
+      if (candidate?.videoId && candidate.videoId !== claim.evidence_video_id) {
+        const staleBefore = new Date(Date.now() - CHANNEL_CLAIM_LEASE_MS).toISOString();
+        this.analyses.reclaimStaleChannel(channelId, candidate.videoId, staleBefore);
+      }
+    }
   }
 
   private submitAvailableAnalyses(inputs: NormalizedInput[]): Map<string, boolean> {
@@ -189,21 +335,23 @@ export class AnalysisRoutes {
       if (!wasCached.has(input.videoId)) {
         const existing = this.analyses.find(input.videoId);
         wasCached.set(input.videoId, existing !== null);
-        if (existing === null || input.transcript !== null) {
+
+        const claim = input.channelId === null ? null : this.analyses.findChannelClaim(input.channelId);
+        const maySubmit = input.channelId === null || claim?.evidence_video_id === input.videoId;
+        if (maySubmit && (existing === null || input.transcript !== null)) {
           submissions.set(input.videoId, input.transcript);
         }
       } else if (input.transcript !== null) {
-        submissions.set(input.videoId, input.transcript);
+        const claim = input.channelId === null ? null : this.analyses.findChannelClaim(input.channelId);
+        if (input.channelId === null || claim?.evidence_video_id === input.videoId) {
+          submissions.set(input.videoId, input.transcript);
+        }
       }
     }
 
     let queued = false;
     for (const [videoId, transcript] of submissions) {
-      const result = this.analyses.submit(
-        videoId,
-        canonicalYouTubeUrl(videoId),
-        transcript,
-      );
+      const result = this.analyses.submit(videoId, canonicalYouTubeUrl(videoId), transcript);
       queued ||= result?.queued ?? false;
     }
     if (queued) this.wakeWorker();
@@ -212,19 +360,55 @@ export class AnalysisRoutes {
   }
 
   private loadEntries(inputs: NormalizedInput[], wasCached: Map<string, boolean>): AnalysisEntry[] {
-    return inputs.map(({ input, videoId, transcript, error }) => {
-      if (error !== null) return failedEntry(input, videoId, this.config.engineVersion, error);
+    return inputs.map(({ input, videoId, channelId, transcript, error }) => {
+      if (error !== null) return failedEntry(input, videoId, channelId, this.config.engineVersion, error);
       if (videoId === null) throw new Error("Normalized input has neither video ID nor error");
 
-      const row = this.analyses.find(videoId);
-      if (row !== null) {
-        if (row.status === "failed" && row.transcript_text === null) {
-          return missingEntry(input, videoId, this.config.engineVersion);
+      const claim = channelId === null ? null : this.analyses.findChannelClaim(channelId);
+      if (claim !== null && claim.evidence_video_id !== videoId) {
+        const evidence = this.analyses.find(claim.evidence_video_id);
+        if (evidence === null) {
+          return waitingOnChannelEntry(
+            input,
+            videoId,
+            channelId!,
+            this.config.engineVersion,
+            claim.evidence_video_id,
+          );
         }
-        return entryFromRow(input, row, wasCached.get(videoId) ?? true);
+        return entryFromRow(
+          input,
+          videoId,
+          channelId,
+          evidence,
+          true,
+          "channel",
+          claim.evidence_video_id,
+        );
       }
+
+      const direct = this.analyses.find(videoId);
+      if (direct !== null) {
+        if (direct.status === "failed" && direct.transcript_text === null) {
+          return missingEntry(input, videoId, channelId, this.config.engineVersion);
+        }
+        return entryFromRow(
+          input,
+          videoId,
+          channelId,
+          direct,
+          wasCached.get(videoId) ?? true,
+          "video",
+          videoId,
+        );
+      }
+
+      if (channelId !== null && claim === null) {
+        return unclaimedChannelEntry(input, videoId, channelId, this.config.engineVersion);
+      }
+
       if (transcript === null) {
-        return missingEntry(input, videoId, this.config.engineVersion);
+        return missingEntry(input, videoId, channelId, this.config.engineVersion);
       }
       throw new Error("Submitted analysis disappeared after insertion");
     });
@@ -243,10 +427,13 @@ export class AnalysisRoutes {
     if (row === null) {
       return json({
         engine_version: this.config.engineVersion,
-        error: { code: "analysis_not_found", message: "No cached analysis exists for this video and engine version." },
+        error: { code: "analysis_not_found", message: "No cached direct analysis exists for this video and engine version." },
       }, 404);
     }
 
-    return json({ engine_version: this.config.engineVersion, analysis: entryFromRow(videoIdInput, row, true) });
+    return json({
+      engine_version: this.config.engineVersion,
+      analysis: entryFromRow(videoIdInput, videoId, null, row, true, "video", videoId),
+    });
   }
 }

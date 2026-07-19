@@ -29,6 +29,21 @@ export function migrate(db: Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_analysis_queue
       ON analysis_results(status, next_retry_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS video_channels (
+      video_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS channel_claims (
+      channel_id TEXT NOT NULL,
+      engine_version TEXT NOT NULL,
+      evidence_video_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(channel_id, engine_version)
+    );
   `);
 
   db.exec(`
@@ -44,5 +59,5 @@ export function migrate(db: Database): void {
         WHERE video_transcripts.video_id = analysis_results.video_id
       );
   `);
-  db.exec("PRAGMA user_version = 2");
+  db.exec("PRAGMA user_version = 3");
 }
