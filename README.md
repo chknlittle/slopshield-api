@@ -2,6 +2,22 @@
 
 A small Bun/TypeScript API that puts a persistent cache and queue in front of the SlopShield Engine v1. The browser extension supplies YouTube transcripts; requests return immediately while uncached analyses run in the background.
 
+## Built with OpenAI Codex and GPT-5.6
+
+We used OpenAI Codex with GPT-5.6 to design and review this API.
+
+Codex helped build the persistent analysis queue and cache.
+
+It helped separate reusable transcripts from versioned results.
+
+It helped design video evidence and channel-level verdicts.
+
+It helped require independent confirmation before an AI channel verdict.
+
+It helped keep failed analyses separate from benign results.
+
+It also helped reason about retries, workers, shutdown, and engine boundaries.
+
 ## Run
 
 Requires [Bun](https://bun.sh/).
